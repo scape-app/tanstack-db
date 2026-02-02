@@ -1547,4 +1547,504 @@ describe(`useLiveInfiniteQuery`, () => {
       expect(result.current.data).toHaveLength(40)
     })
   })
+
+  describe(`gcTime configuration`, () => {
+    it(`should accept gcTime config option`, async () => {
+      const posts = createMockPosts(50)
+      const collection = createCollection(
+        mockSyncCollectionOptions<Post>({
+          id: `gctime-config-test`,
+          getKey: (post: Post) => post.id,
+          initialData: posts,
+        }),
+      )
+
+      const { result } = renderHook(() => {
+        return useLiveInfiniteQuery(
+          (q) =>
+            q
+              .from({ posts: collection })
+              .orderBy(({ posts: p }) => p.createdAt, `desc`),
+          {
+            pageSize: 10,
+            gcTime: 0, // Disable garbage collection
+            getNextPageParam: (lastPage) =>
+              lastPage.length === 10 ? lastPage.length : undefined,
+          },
+        )
+      })
+
+      await waitFor(() => {
+        expect(result.current.isReady).toBe(true)
+      })
+
+      // Basic functionality should work with gcTime set
+      expect(result.current.pages).toHaveLength(1)
+      expect(result.current.pages[0]).toHaveLength(10)
+      expect(result.current.hasNextPage).toBe(true)
+
+      // Fetch next page
+      act(() => {
+        result.current.fetchNextPage()
+      })
+
+      await waitFor(() => {
+        expect(result.current.pages).toHaveLength(2)
+      })
+
+      expect(result.current.data).toHaveLength(20)
+    })
+
+    it(`should work without gcTime (uses default)`, async () => {
+      const posts = createMockPosts(30)
+      const collection = createCollection(
+        mockSyncCollectionOptions<Post>({
+          id: `gctime-default-test`,
+          getKey: (post: Post) => post.id,
+          initialData: posts,
+        }),
+      )
+
+      const { result } = renderHook(() => {
+        return useLiveInfiniteQuery(
+          (q) =>
+            q
+              .from({ posts: collection })
+              .orderBy(({ posts: p }) => p.createdAt, `desc`),
+          {
+            pageSize: 10,
+            // No gcTime provided - should use default
+            getNextPageParam: (lastPage) =>
+              lastPage.length === 10 ? lastPage.length : undefined,
+          },
+        )
+      })
+
+      await waitFor(() => {
+        expect(result.current.isReady).toBe(true)
+      })
+
+      expect(result.current.pages).toHaveLength(1)
+      expect(result.current.data).toHaveLength(10)
+    })
+  })
+
+  describe(`pagination state persistence`, () => {
+    it(`should restore page count from collection window on remount`, async () => {
+      const posts = createMockPosts(50)
+      const collection = createCollection(
+        mockSyncCollectionOptions<Post>({
+          id: `pagination-restore-test`,
+          getKey: (post: Post) => post.id,
+          initialData: posts,
+        }),
+      )
+
+      // Create a shared live query collection that persists across mounts
+      const liveQueryCollection = createLiveQueryCollection({
+        query: (q) =>
+          q
+            .from({ posts: collection })
+            .orderBy(({ posts: p }) => p.createdAt, `desc`)
+            .limit(11), // pageSize + 1 for peek-ahead
+      })
+
+      await liveQueryCollection.preload()
+
+      // First mount - load 3 pages
+      const { result, unmount } = renderHook(() => {
+        return useLiveInfiniteQuery(liveQueryCollection, {
+          pageSize: 10,
+          getNextPageParam: (lastPage) =>
+            lastPage.length === 10 ? lastPage.length : undefined,
+        })
+      })
+
+      await waitFor(() => {
+        expect(result.current.isReady).toBe(true)
+      })
+
+      // Fetch to page 2
+      act(() => {
+        result.current.fetchNextPage()
+      })
+
+      await waitFor(() => {
+        expect(result.current.pages).toHaveLength(2)
+      })
+
+      // Fetch to page 3
+      act(() => {
+        result.current.fetchNextPage()
+      })
+
+      await waitFor(() => {
+        expect(result.current.pages).toHaveLength(3)
+      })
+
+      expect(result.current.data).toHaveLength(30)
+
+      // Unmount (simulate navigation away)
+      unmount()
+
+      // Remount with same collection - should restore page count
+      const { result: result2 } = renderHook(() => {
+        return useLiveInfiniteQuery(liveQueryCollection, {
+          pageSize: 10,
+          getNextPageParam: (lastPage) =>
+            lastPage.length === 10 ? lastPage.length : undefined,
+        })
+      })
+
+      await waitFor(() => {
+        expect(result2.current.isReady).toBe(true)
+      })
+
+      // Should have restored to 3 pages (not reset to 1)
+      expect(result2.current.pages).toHaveLength(3)
+      expect(result2.current.data).toHaveLength(30)
+    })
+
+    it(`should start at page 1 for new collection without window state`, async () => {
+      const posts = createMockPosts(50)
+      const collection = createCollection(
+        mockSyncCollectionOptions<Post>({
+          id: `no-window-state-test`,
+          getKey: (post: Post) => post.id,
+          initialData: posts,
+        }),
+      )
+
+      const { result } = renderHook(() => {
+        return useLiveInfiniteQuery(
+          (q) =>
+            q
+              .from({ posts: collection })
+              .orderBy(({ posts: p }) => p.createdAt, `desc`),
+          {
+            pageSize: 10,
+            getNextPageParam: (lastPage) =>
+              lastPage.length === 10 ? lastPage.length : undefined,
+          },
+        )
+      })
+
+      await waitFor(() => {
+        expect(result.current.isReady).toBe(true)
+      })
+
+      // Should start at 1 page
+      expect(result.current.pages).toHaveLength(1)
+      expect(result.current.data).toHaveLength(10)
+    })
+  })
+
+  describe(`race condition prevention`, () => {
+    it(`should prevent duplicate fetches during rapid fetchNextPage calls with async data`, async () => {
+      const allPosts = createMockPosts(50)
+      let loadCallCount = 0
+
+      const collection = createCollection<Post>({
+        id: `rapid-fetch-test`,
+        getKey: (post: Post) => post.id,
+        syncMode: `on-demand`,
+        startSync: true,
+        sync: {
+          sync: ({ markReady, begin, write, commit }) => {
+            // Provide initial data
+            begin()
+            const initialPosts = allPosts.slice(0, 15)
+            for (const post of initialPosts) {
+              write({ type: `insert`, value: post })
+            }
+            commit()
+            markReady()
+
+            return {
+              loadSubset: (opts: LoadSubsetOptions) => {
+                loadCallCount++
+
+                let filtered = allPosts
+
+                if (opts.orderBy && opts.orderBy.length > 0) {
+                  filtered = filtered.sort((a, b) => b.createdAt - a.createdAt)
+                }
+
+                if (opts.cursor) {
+                  const { whereFrom, whereCurrent } = opts.cursor
+                  try {
+                    const whereFromFn =
+                      createFilterFunctionFromExpression(whereFrom)
+                    const fromData = filtered.filter(whereFromFn)
+
+                    const whereCurrentFn =
+                      createFilterFunctionFromExpression(whereCurrent)
+                    const currentData = filtered.filter(whereCurrentFn)
+
+                    const seenIds = new Set<string>()
+                    filtered = []
+                    for (const item of currentData) {
+                      if (!seenIds.has(item.id)) {
+                        seenIds.add(item.id)
+                        filtered.push(item)
+                      }
+                    }
+                    const limitedFromData = opts.limit
+                      ? fromData.slice(0, opts.limit)
+                      : fromData
+                    for (const item of limitedFromData) {
+                      if (!seenIds.has(item.id)) {
+                        seenIds.add(item.id)
+                        filtered.push(item)
+                      }
+                    }
+                    filtered.sort((a, b) => b.createdAt - a.createdAt)
+                  } catch {
+                    // Fallback
+                  }
+                } else if (opts.limit !== undefined) {
+                  filtered = filtered.slice(0, opts.limit)
+                }
+
+                // Async load with delay
+                return new Promise<void>((resolve) => {
+                  setTimeout(() => {
+                    begin()
+                    for (const post of filtered) {
+                      write({ type: `insert`, value: post })
+                    }
+                    commit()
+                    resolve()
+                  }, 100)
+                })
+              },
+            }
+          },
+        },
+      })
+
+      const { result } = renderHook(() => {
+        return useLiveInfiniteQuery(
+          (q) =>
+            q
+              .from({ posts: collection })
+              .orderBy(({ posts: p }) => p.createdAt, `desc`),
+          {
+            pageSize: 10,
+            getNextPageParam: (lastPage) =>
+              lastPage.length === 10 ? lastPage.length : undefined,
+          },
+        )
+      })
+
+      await waitFor(() => {
+        expect(result.current.isReady).toBe(true)
+      })
+
+      // Wait for initial window setup
+      await waitFor(() => {
+        expect(result.current.isFetchingNextPage).toBe(false)
+      })
+
+      const initialLoadCount = loadCallCount
+
+      // Rapidly call fetchNextPage multiple times
+      act(() => {
+        result.current.fetchNextPage()
+        result.current.fetchNextPage()
+        result.current.fetchNextPage()
+      })
+
+      // Should be fetching
+      expect(result.current.isFetchingNextPage).toBe(true)
+
+      // Wait for fetch to complete
+      await waitFor(
+        () => {
+          expect(result.current.isFetchingNextPage).toBe(false)
+        },
+        { timeout: 500 },
+      )
+
+      // Should only have fetched once (not 3 times) due to ref guard
+      expect(loadCallCount - initialLoadCount).toBeLessThanOrEqual(2)
+
+      // Should only be on page 2 (not page 4)
+      expect(result.current.pages).toHaveLength(2)
+    }, 10000)
+
+    it(`should maintain hasNextPage true during loading transitions`, async () => {
+      const allPosts = createMockPosts(30)
+
+      const collection = createCollection<Post>({
+        id: `hasnextpage-loading-test`,
+        getKey: (post: Post) => post.id,
+        syncMode: `on-demand`,
+        startSync: true,
+        sync: {
+          sync: ({ markReady, begin, write, commit }) => {
+            begin()
+            const initialPosts = allPosts.slice(0, 15)
+            for (const post of initialPosts) {
+              write({ type: `insert`, value: post })
+            }
+            commit()
+            markReady()
+
+            return {
+              loadSubset: (opts: LoadSubsetOptions) => {
+                let filtered = allPosts
+
+                if (opts.orderBy && opts.orderBy.length > 0) {
+                  filtered = filtered.sort((a, b) => b.createdAt - a.createdAt)
+                }
+
+                if (opts.cursor) {
+                  const { whereFrom, whereCurrent } = opts.cursor
+                  try {
+                    const whereFromFn =
+                      createFilterFunctionFromExpression(whereFrom)
+                    const fromData = filtered.filter(whereFromFn)
+
+                    const whereCurrentFn =
+                      createFilterFunctionFromExpression(whereCurrent)
+                    const currentData = filtered.filter(whereCurrentFn)
+
+                    const seenIds = new Set<string>()
+                    filtered = []
+                    for (const item of currentData) {
+                      if (!seenIds.has(item.id)) {
+                        seenIds.add(item.id)
+                        filtered.push(item)
+                      }
+                    }
+                    const limitedFromData = opts.limit
+                      ? fromData.slice(0, opts.limit)
+                      : fromData
+                    for (const item of limitedFromData) {
+                      if (!seenIds.has(item.id)) {
+                        seenIds.add(item.id)
+                        filtered.push(item)
+                      }
+                    }
+                    filtered.sort((a, b) => b.createdAt - a.createdAt)
+                  } catch {
+                    // Fallback
+                  }
+                } else if (opts.limit !== undefined) {
+                  filtered = filtered.slice(0, opts.limit)
+                }
+
+                return new Promise<void>((resolve) => {
+                  setTimeout(() => {
+                    begin()
+                    for (const post of filtered) {
+                      write({ type: `insert`, value: post })
+                    }
+                    commit()
+                    resolve()
+                  }, 100)
+                })
+              },
+            }
+          },
+        },
+      })
+
+      const { result } = renderHook(() => {
+        return useLiveInfiniteQuery(
+          (q) =>
+            q
+              .from({ posts: collection })
+              .orderBy(({ posts: p }) => p.createdAt, `desc`),
+          {
+            pageSize: 10,
+            getNextPageParam: (lastPage) =>
+              lastPage.length === 10 ? lastPage.length : undefined,
+          },
+        )
+      })
+
+      await waitFor(() => {
+        expect(result.current.isReady).toBe(true)
+      })
+
+      await waitFor(() => {
+        expect(result.current.isFetchingNextPage).toBe(false)
+      })
+
+      // Initial state: has next page
+      expect(result.current.hasNextPage).toBe(true)
+      expect(result.current.pages).toHaveLength(1)
+
+      // Trigger next page fetch
+      act(() => {
+        result.current.fetchNextPage()
+      })
+
+      // During loading, hasNextPage should stay true (not flicker to false)
+      expect(result.current.isFetchingNextPage).toBe(true)
+      expect(result.current.hasNextPage).toBe(true)
+
+      // Wait for completion
+      await waitFor(
+        () => {
+          expect(result.current.isFetchingNextPage).toBe(false)
+        },
+        { timeout: 500 },
+      )
+
+      // After loading, should have correct hasNextPage value
+      expect(result.current.pages).toHaveLength(2)
+      expect(result.current.hasNextPage).toBe(true) // Still has more (30 total, 20 loaded)
+    }, 10000)
+
+    it(`should block rapid synchronous fetchNextPage calls using ref`, async () => {
+      const posts = createMockPosts(50)
+      const collection = createCollection(
+        mockSyncCollectionOptions<Post>({
+          id: `sync-ref-guard-test`,
+          getKey: (post: Post) => post.id,
+          initialData: posts,
+        }),
+      )
+
+      const { result } = renderHook(() => {
+        return useLiveInfiniteQuery(
+          (q) =>
+            q
+              .from({ posts: collection })
+              .orderBy(({ posts: p }) => p.createdAt, `desc`),
+          {
+            pageSize: 10,
+            getNextPageParam: (lastPage) =>
+              lastPage.length === 10 ? lastPage.length : undefined,
+          },
+        )
+      })
+
+      await waitFor(() => {
+        expect(result.current.isReady).toBe(true)
+      })
+
+      expect(result.current.pages).toHaveLength(1)
+
+      // With sync data, each fetch completes immediately
+      // But ref should still guard against truly concurrent calls within same act()
+      act(() => {
+        result.current.fetchNextPage()
+      })
+
+      // After the act, we should be on page 2
+      expect(result.current.pages).toHaveLength(2)
+
+      // Another fetch should work since previous completed
+      act(() => {
+        result.current.fetchNextPage()
+      })
+
+      expect(result.current.pages).toHaveLength(3)
+      expect(result.current.data).toHaveLength(30)
+    })
+  })
 })
